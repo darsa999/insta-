@@ -1,0 +1,32 @@
+# Credentials & Secrets — never commit these
+.env
+.env.*
+!.env.example
+.session
+*.session
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+instagram_tracker.db
+
+# Media & Assets
+profile_pics/
+screenshots/
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# IDE & Editor settings
+.idea/
+.vscode/
+
+# Logs & temp files
+*.log
+scratch/
