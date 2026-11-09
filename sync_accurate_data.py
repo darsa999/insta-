@@ -176,10 +176,18 @@ def resolve_target_user_id(loader: instaloader.Instaloader, sess: requests.Sessi
 # Stealth Web REST API Fetcher
 # ---------------------------------------------------------------------------
 
+class IncompleteFetchError(RuntimeError):
+    """Raised when pagination stops before Instagram reports the end of the list."""
+
+
 def fetch_list_stealth(sess: requests.Session, user_id: str, mode: str) -> dict[str, str]:
     """
     Stealthily pages through followers or following with human-mimicking delay logic.
     Returns a dict mapping username -> numeric user_id (pk).
+
+    Raises IncompleteFetchError if any page fails. Previously a failed page
+    just stopped the loop and the PARTIAL list was written to the database,
+    wiping real rows and logging bogus 'unfollower' events.
     """
     endpoint = (
         f"https://www.instagram.com/api/v1/friendships/{user_id}/followers/"
@@ -200,8 +208,7 @@ def fetch_list_stealth(sess: requests.Session, user_id: str, mode: str) -> dict[
         try:
             r = sess.get(endpoint, params=params, timeout=20)
         except Exception as exc:
-            log.error("Request error on page %d (%s): %s", page, mode, exc)
-            break
+            raise IncompleteFetchError(f"Request error on page {page} ({mode}): {exc}") from exc
 
         if r.status_code == 401:
             print("\n" + "!"*60)
@@ -213,10 +220,14 @@ def fetch_list_stealth(sess: requests.Session, user_id: str, mode: str) -> dict[
             sys.exit(1)
 
         if r.status_code != 200:
-            log.warning("HTTP %d on page %d (%s) — stopping. Response: %s", r.status_code, page, mode, r.text[:200])
-            break
+            raise IncompleteFetchError(
+                f"HTTP {r.status_code} on page {page} ({mode}). Response: {r.text[:200]}"
+            )
 
-        data = r.json()
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise IncompleteFetchError(f"Non-JSON response on page {page} ({mode}).") from exc
         users = data.get("users", [])
         
         for u in users:
@@ -363,9 +374,10 @@ def sync_to_db(
     )
 
     # Cache user IDs
-    for u, uid in {**followers, **following}.items():
-        if uid:
-            conn.execute("INSERT OR REPLACE INTO user_id_cache (username, user_id) VALUES (?, ?)", (u, uid))
+    conn.executemany(
+        "INSERT OR REPLACE INTO user_id_cache (username, user_id) VALUES (?, ?)",
+        [(u, uid) for u, uid in {**followers, **following}.items() if uid],
+    )
 
     # Update last_checked
     now = datetime.now(timezone.utc).isoformat()
@@ -404,9 +416,11 @@ def main() -> None:
         print(f"\n[ERROR] {exc}")
         sys.exit(1)
 
-    # Also save target_uid into user_id_cache
+    # Also save target_uid into user_id_cache (schema created first so this
+    # does not silently fail on a brand-new database)
     try:
         conn = sqlite3.connect(DB_PATH)
+        conn.executescript(SCHEMA_MIGRATION)
         conn.execute("INSERT OR REPLACE INTO user_id_cache (username, user_id) VALUES (?, ?)", (TARGET, target_uid))
         conn.commit()
         conn.close()
@@ -417,8 +431,13 @@ def main() -> None:
     log.info("Opening Connection A to fetch FOLLOWING...")
     sess_a = create_web_session(L)
     print(f"[1/2] Fetching FOLLOWING of @{TARGET}...")
-    following = fetch_list_stealth(sess_a, target_uid, "following")
-    sess_a.close()
+    try:
+        following = fetch_list_stealth(sess_a, target_uid, "following")
+    except IncompleteFetchError as exc:
+        print(f"\n[ERROR] Following list fetch failed: {exc}\nDatabase NOT modified.")
+        sys.exit(1)
+    finally:
+        sess_a.close()
 
     # Pause 10 seconds between connections
     log.info("Split Mode: Waiting 10 seconds before opening Connection B...")
@@ -428,8 +447,13 @@ def main() -> None:
     log.info("Opening Connection B to fetch FOLLOWERS...")
     sess_b = create_web_session(L)
     print(f"[2/2] Fetching FOLLOWERS of @{TARGET}...")
-    followers = fetch_list_stealth(sess_b, target_uid, "followers")
-    sess_b.close()
+    try:
+        followers = fetch_list_stealth(sess_b, target_uid, "followers")
+    except IncompleteFetchError as exc:
+        print(f"\n[ERROR] Followers list fetch failed: {exc}\nDatabase NOT modified.")
+        sys.exit(1)
+    finally:
+        sess_b.close()
 
     follower_set = set(followers.keys())
     following_set = set(following.keys())

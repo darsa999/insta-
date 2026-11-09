@@ -5,16 +5,13 @@ Instagram Relations & Automation Dashboard for @darsal1a.
 Built with Streamlit, SQLite, and authenticated browser session requests.
 """
 
-import os
+import html
 import sys
 import time
 import random
 import subprocess
-import sqlite3
-import pandas as pd
 import streamlit as st
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime
 
 import instagram_service
 import instagram_actions
@@ -245,8 +242,11 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # ---------------------------------------------------------------------------
 TARGET = instagram_service.TARGET_USERNAME
 
+@st.cache_data(show_spinner=False)
 def load_data():
-    """Load fresh relationship dataset for @darsal1a."""
+    """Load relationship dataset. Cached: Streamlit reruns the whole script on
+    every checkbox click, so the DB is only re-read after load_data.clear()
+    (called after sync, session import and unfollow batches)."""
     return instagram_service.load_relationship_data()
 
 data = load_data()
@@ -256,6 +256,7 @@ mutuals = data["mutuals"]
 not_following_back = data["not_following_back"]
 fans = data["fans"]
 events = data["events"]
+event_count = data.get("event_count", len(events))
 last_checked = data["last_checked"]
 user_id_map = data["user_id_map"]
 
@@ -314,6 +315,7 @@ if st.sidebar.button("Run Live Sync Now", use_container_width=True):
                 timeout=300
             )
             st.sidebar.success("Sync completed successfully!")
+            load_data.clear()
             st.rerun()
         except subprocess.CalledProcessError as err:
             st.sidebar.error("Sync failed!")
@@ -339,6 +341,7 @@ if st.sidebar.button("Import Browser Session", use_container_width=True):
             )
             if res.returncode == 0:
                 st.sidebar.success("Session imported and saved!")
+                load_data.clear()
                 st.rerun()
             else:
                 st.sidebar.warning("Cookie extraction failed. Check browser lock.")
@@ -459,52 +462,40 @@ with tab_relations:
         unsafe_allow_html=True
     )
 
-    category_labels = [
-        f"Not Following Back ({len(not_following_back)})",
-        f"Mutuals ({len(mutuals)})",
-        f"All Following ({len(following)})",
-        f"All Followers ({len(fans) + len(mutuals)})",
-    ]
+    # key -> (label, users, description, can_unfollow)
+    CATEGORIES = {
+        "not_following_back": ("Not Following Back", not_following_back,
+                               f"Accounts that @{TARGET} follows who do NOT follow back.", True),
+        "mutuals": ("Mutuals", mutuals,
+                    f"Reciprocal connections: accounts @{TARGET} follows who follow back.", True),
+        "all_following": ("All Following", following,
+                          f"Complete list of all accounts followed by @{TARGET}.", True),
+        "all_followers": ("All Followers", followers,
+                          f"Complete list of accounts following @{TARGET}.", False),
+    }
 
-    selected_category_label = st.selectbox(
+    current_category = st.selectbox(
         "Select Relationship Category",
-        category_labels,
+        list(CATEGORIES),
         index=0,
+        format_func=lambda k: f"{CATEGORIES[k][0]} ({len(CATEGORIES[k][1])})",
         help="Filter user list by reciprocal relationship status"
     )
-
-    # Determine active category key and user set
-    if "Not Following Back" in selected_category_label:
-        current_category = "not_following_back"
-        current_users = sorted(list(not_following_back))
-        category_desc = f"Accounts that @{TARGET} follows who do NOT follow back."
-        can_unfollow = True
-    elif "Mutuals" in selected_category_label:
-        current_category = "mutuals"
-        current_users = sorted(list(mutuals))
-        category_desc = f"Reciprocal connections: accounts @{TARGET} follows who follow back."
-        can_unfollow = True
-    elif "All Following" in selected_category_label:
-        current_category = "all_following"
-        current_users = sorted(list(following))
-        category_desc = f"Complete list of all accounts followed by @{TARGET}."
-        can_unfollow = True
-    else:
-        current_category = "all_followers"
-        current_users = sorted(list(followers))
-        category_desc = f"Complete list of accounts following @{TARGET}."
-        can_unfollow = False
+    category_name, category_set, category_desc, can_unfollow = CATEGORIES[current_category]
+    current_users = sorted(category_set)
+    selected_category_label = category_name
 
     # Search filter
     search_col, count_col = st.columns([3, 1])
     with search_col:
         search_term = st.text_input(
-            f"🔍 Search within {selected_category_label.split('(')[0].strip()}",
+            f"🔍 Search within {category_name}",
             placeholder="Type to filter usernames...",
             key=f"search_{current_category}"
         )
     with count_col:
-        filtered_users = [u for u in current_users if search_term.lower() in u.lower()] if search_term else current_users
+        needle = search_term.strip().lower()
+        filtered_users = [u for u in current_users if needle in u.lower()] if needle else current_users
         st.markdown(
             f'<div style="text-align: right; padding-top: 30px; font-weight: 600; color: #94a3b8; font-size: 0.9rem;">'
             f'Showing {len(filtered_users)} of {len(current_users)}'
@@ -567,12 +558,22 @@ with tab_relations:
         if st.session_state.page_num < total_pages:
             st.session_state.page_num += 1
 
+    # Sync checkbox widget state into selected_users BEFORE counting. The rows
+    # (and their checkboxes) render further down, so without this the counters
+    # and the Unfollow button lagged one click behind.
+    for u in current_page_users:
+        if f"chk_{u}" in st.session_state:
+            st.session_state.selected_users[u] = st.session_state[f"chk_{u}"]
+
     # Compute counters: selection on active page and total selection across all pages
     selected_on_page = sum(1 for u in current_page_users if st.session_state.selected_users.get(u, False))
-    selected_to_unfollow = [
+    # Only users in the CURRENT category (and still followed) count. Previously a
+    # selection made under "Mutuals" stayed active after switching to "Not
+    # Following Back", so mutuals could be unfollowed without being visible.
+    selected_to_unfollow = sorted(
         u for u, is_sel in st.session_state.selected_users.items()
-        if is_sel and (u in following if can_unfollow else True)
-    ]
+        if is_sel and u in category_set and u in following
+    ) if can_unfollow else []
     total_selected = len(selected_to_unfollow)
 
     # Paginated Bulk Selection Controls
@@ -673,14 +674,10 @@ with tab_relations:
                     # Live status message displaying username currently being processed
                     status_text.markdown(f"⏳ **[{idx}/{total_unfollow}]** Processing unfollow for **@{uname}**...")
                     
-                    uid = user_id_map.get(uname)
-                    if not uid:
-                        uid = instagram_actions.resolve_user_id(uname, session=sess)
-
-                    # Send unfollow POST request via instagram_actions.py
+                    # unfollow_user resolves the ID itself when it is not in the map
                     success, message, is_fatal = instagram_actions.unfollow_user(
                         uname,
-                        user_id=uid,
+                        user_id=user_id_map.get(uname),
                         session=sess,
                         csrftoken=csrf
                     )
@@ -708,17 +705,22 @@ with tab_relations:
                         st.error(f"⚠️ Instagram rate limit/checkpoint encountered on @{uname}: {message}. Process stopped immediately to safeguard your account.")
                         break
 
-                    # Safety jitter delay between requests (3.0 to 5.5 seconds)
-                    if idx < total_unfollow and success:
+                    # Safety jitter delay between ALL requests (3.0 to 5.5 seconds).
+                    # Previously failures skipped the delay, so a run of errors
+                    # fired requests back-to-back — the fastest way to get rate-limited.
+                    if idx < total_unfollow:
                         jitter = round(random.uniform(3.0, 5.5), 2)
-                        status_text.markdown(f"⏳ **[{idx}/{total_unfollow}]** Unfollowed **@{uname}**. Sleeping for **{jitter}s** (safety jitter delay)...")
+                        verb = "Unfollowed" if success else "Failed"
+                        status_text.markdown(f"⏳ **[{idx}/{total_unfollow}]** {verb} **@{uname}**. Sleeping for **{jitter}s** (safety jitter delay)...")
                         time.sleep(jitter)
 
+                # DB changed (rows removed) — drop the cached dataset.
+                load_data.clear()
                 if halted:
-                    st.warning(f"Batch halted early. Successfully unfollowed {completed} user(s) before stopping.")
+                    st.warning(f"Batch halted early. Successfully unfollowed {completed} user(s) before stopping. Refresh to update counters.")
                 else:
                     status_text.markdown("✨ **Batch execution complete!**")
-                    st.success(f"🎉 Successfully unfollowed {completed} account(s). Database updated immediately.")
+                    st.success(f"🎉 Unfollowed {completed} account(s), {failed} failed. Database updated immediately.")
                     time.sleep(1.5)
                     # Call st.rerun() only after the entire batch finishes to refresh the UI and counters
                     st.rerun()
@@ -836,10 +838,10 @@ with tab_history:
             unsafe_allow_html=True
         )
     else:
-        st.write(f"Total events recorded: **{len(events)}**")
+        st.write(f"Total events recorded: **{event_count}**")
         for ev in events[:60]:
             event_type = ev["event_type"]
-            uname = ev["username"]
+            uname = html.escape(ev["username"])
             ts = ev["detected_at"]
             
             try:
